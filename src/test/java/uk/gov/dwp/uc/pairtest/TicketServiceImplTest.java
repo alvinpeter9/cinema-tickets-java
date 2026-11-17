@@ -1,27 +1,44 @@
 package uk.gov.dwp.uc.pairtest;
 
-import java.util.ArrayList;
-import java.util.List;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import thirdparty.paymentgateway.TicketPaymentService;
+import thirdparty.seatbooking.SeatReservationService;
 import uk.gov.dwp.uc.pairtest.domain.TicketTypeRequest;
 import uk.gov.dwp.uc.pairtest.exception.InvalidPurchaseException;
+import uk.gov.dwp.uc.pairtest.exception.PaymentFailedException;
+import uk.gov.dwp.uc.pairtest.exception.SeatReservationFailedException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static uk.gov.dwp.uc.pairtest.domain.TicketTypeRequest.Type.ADULT;
 import static uk.gov.dwp.uc.pairtest.domain.TicketTypeRequest.Type.CHILD;
 import static uk.gov.dwp.uc.pairtest.domain.TicketTypeRequest.Type.INFANT;
 
 class TicketServiceImplTest {
-    private final List<ProviderCall> calls = new ArrayList<>();
-    private final TicketService service = new TicketServiceImpl(
-            (accountId, amount) -> calls.add(new ProviderCall("payment", accountId, amount)),
-            (accountId, seats) -> calls.add(new ProviderCall("reservation", accountId, seats)));
+    private final TicketPaymentService ticketPaymentService = mock(TicketPaymentService.class);
+    private final SeatReservationService seatReservationService = mock(SeatReservationService.class);
+    private final TicketService service = new TicketServiceImpl(ticketPaymentService, seatReservationService);
+
+    @Test
+    void purchasesSingleAdultTicket() {
+        service.purchaseTickets(1L, new TicketTypeRequest(ADULT, 1));
+
+        var order = inOrder(ticketPaymentService, seatReservationService);
+        order.verify(ticketPaymentService).makePayment(1L, 25);
+        order.verify(seatReservationService).reserveSeat(1L, 1);
+        verifyNoMoreInteractions(ticketPaymentService, seatReservationService);
+    }
 
     @Test
     void combinesRepeatedTypesAndChargesOnlyForAdultsAndChildren() {
@@ -29,8 +46,10 @@ class TicketServiceImplTest {
                 new TicketTypeRequest(CHILD, 3), new TicketTypeRequest(ADULT, 1),
                 new TicketTypeRequest(INFANT, 2), new TicketTypeRequest(CHILD, 0));
 
-        assertEquals(List.of(new ProviderCall("payment", 42L, 95),
-                new ProviderCall("reservation", 42L, 5)), calls);
+        var order = inOrder(ticketPaymentService, seatReservationService);
+        order.verify(ticketPaymentService).makePayment(42L, 95);
+        order.verify(seatReservationService).reserveSeat(42L, 5);
+        verifyNoMoreInteractions(ticketPaymentService, seatReservationService);
     }
 
     @Test
@@ -38,46 +57,52 @@ class TicketServiceImplTest {
         service.purchaseTickets(1L, new TicketTypeRequest(ADULT, 20),
                 new TicketTypeRequest(INFANT, 5));
 
-        assertEquals(List.of(new ProviderCall("payment", 1L, 500),
-                new ProviderCall("reservation", 1L, 20)), calls);
+        var order = inOrder(ticketPaymentService, seatReservationService);
+        order.verify(ticketPaymentService).makePayment(1L, 500);
+        order.verify(seatReservationService).reserveSeat(1L, 20);
+        verifyNoMoreInteractions(ticketPaymentService, seatReservationService);
     }
 
     @Test
     void reportsPaymentFailureAndSkipsReservation() {
         var cause = new RuntimeException("Payment provider unavailable");
-        TicketService failingService = new TicketServiceImpl(
-                (accountId, amount) -> { throw cause; },
-                (accountId, seats) -> calls.add(new ProviderCall("reservation", accountId, seats)));
+        doThrow(cause).when(ticketPaymentService).makePayment(1L, 25);
 
-        var failure = assertThrows(IllegalStateException.class,
-                () -> failingService.purchaseTickets(1L, new TicketTypeRequest(ADULT, 1)));
+        var failure = assertThrows(PaymentFailedException.class,
+                () -> service.purchaseTickets(1L, new TicketTypeRequest(ADULT, 1)));
 
         assertEquals("Ticket payment failed", failure.getMessage());
         assertSame(cause, failure.getCause());
-        assertEquals(List.of(), calls);
+        verify(ticketPaymentService).makePayment(1L, 25);
+        verifyNoInteractions(seatReservationService);
+        verifyNoMoreInteractions(ticketPaymentService, seatReservationService);
     }
 
     @Test
     void reportsReservationFailureAfterPayment() {
         var cause = new RuntimeException("Reservation provider unavailable");
-        TicketService failingService = new TicketServiceImpl(
-                (accountId, amount) -> calls.add(new ProviderCall("payment", accountId, amount)),
-                (accountId, seats) -> { throw cause; });
+        doThrow(cause).when(seatReservationService).reserveSeat(1L, 1);
 
-        var failure = assertThrows(IllegalStateException.class,
-                () -> failingService.purchaseTickets(1L, new TicketTypeRequest(ADULT, 1)));
+        var failure = assertThrows(SeatReservationFailedException.class,
+                () -> service.purchaseTickets(1L, new TicketTypeRequest(ADULT, 1)));
 
         assertEquals("Seat reservation failed after payment", failure.getMessage());
         assertSame(cause, failure.getCause());
-        assertEquals(List.of(new ProviderCall("payment", 1L, 25)), calls);
+
+        var order = inOrder(ticketPaymentService, seatReservationService);
+        order.verify(ticketPaymentService).makePayment(1L, 25);
+        order.verify(seatReservationService).reserveSeat(1L, 1);
+        verifyNoMoreInteractions(ticketPaymentService, seatReservationService);
     }
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("invalidPurchases")
-    void rejectsInvalidPurchasesBeforeCallingProviders(String scenario, Long accountId,
-                                                       TicketTypeRequest[] requests) {
-        assertThrows(InvalidPurchaseException.class, () -> service.purchaseTickets(accountId, requests));
-        assertEquals(List.of(), calls);
+    void rejectsInvalidPurchasesBeforeCallingProviders(
+            String scenario, Long accountId, TicketTypeRequest[] requests) {
+        assertThrows(InvalidPurchaseException.class,
+                () -> service.purchaseTickets(accountId, requests));
+
+        verifyNoInteractions(ticketPaymentService, seatReservationService);
     }
 
     private static Stream<Arguments> invalidPurchases() {
@@ -103,8 +128,5 @@ class TicketServiceImplTest {
 
     private static Arguments invalid(String scenario, Long accountId, TicketTypeRequest... requests) {
         return Arguments.of(scenario, accountId, requests);
-    }
-
-    private record ProviderCall(String operation, long accountId, int value) {
     }
 }

@@ -7,6 +7,8 @@ import thirdparty.seatbooking.SeatReservationService;
 import thirdparty.seatbooking.SeatReservationServiceImpl;
 import uk.gov.dwp.uc.pairtest.domain.TicketTypeRequest;
 import uk.gov.dwp.uc.pairtest.exception.InvalidPurchaseException;
+import uk.gov.dwp.uc.pairtest.exception.PaymentFailedException;
+import uk.gov.dwp.uc.pairtest.exception.SeatReservationFailedException;
 
 public class TicketServiceImpl implements TicketService {
     private static final System.Logger LOGGER = System.getLogger(TicketServiceImpl.class.getName());
@@ -40,14 +42,14 @@ public class TicketServiceImpl implements TicketService {
             paymentService.makePayment(accountId, totals.amountToPay());
         } catch (RuntimeException cause) {
             LOGGER.log(System.Logger.Level.ERROR, "Ticket payment failed");
-            throw new IllegalStateException("Ticket payment failed", cause);
+            throw new PaymentFailedException(cause);
         }
 
         try {
             seatService.reserveSeat(accountId, totals.seatsToReserve());
         } catch (RuntimeException cause) {
             LOGGER.log(System.Logger.Level.ERROR, "Seat reservation failed after payment");
-            throw new IllegalStateException("Seat reservation failed after payment", cause);
+            throw new SeatReservationFailedException(cause);
         }
 
         LOGGER.log(System.Logger.Level.INFO,
